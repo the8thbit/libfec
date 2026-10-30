@@ -2,7 +2,7 @@
 
 use jiff::civil::Date;
 
-use crate::covers::fields::{amount, date, flag, key, text, text_or_empty, Fields};
+use crate::covers::fields::{amount, date, flag, key, text, text_or_empty, year_in_range, Fields};
 use crate::itemizations::{text_any, CandidateRef, Entity};
 
 /// "SCHEDULE C - LOANS": one loan a committee has received or made, with the
@@ -64,6 +64,7 @@ use crate::itemizations::{text_any, CandidateRef, Entity};
     pyo3::pyclass(module = "libfec.itemizations", frozen, get_all, skip_from_py_object)
 )]
 #[derive(Debug, Clone, serde::Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ScheduleC {
     /// The row type as filed, `SC/` plus the line number: `SC/10`. Column
     /// `form_type` (FEC format workbook v8.4, sheet `Sch C`, field 1).
@@ -151,6 +152,7 @@ pub struct ScheduleC {
     pyo3::pyclass(module = "libfec.itemizations", frozen, get_all, skip_from_py_object)
 )]
 #[derive(Debug, Clone, serde::Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ScheduleCGuarantor {
     /// Name and address. Columns `guarantor_N_name` ("IND/NAME
     /// (ENDORSER/GUARANTOR)", split per [`Entity::from_prefixed`]),
@@ -256,14 +258,16 @@ pub(crate) fn yes_no<F: Fields + ?Sized>(data: &F, key: &str) -> Option<bool> {
 pub(crate) fn terms_date(raw: &str) -> Option<Date> {
     let raw = raw.trim();
     if let Ok(d) = Date::strptime("%Y%m%d", raw) {
-        return Some(d);
+        return year_in_range(d);
     }
     let mut parts = raw.split('/');
     let (m, d, y) = (parts.next()?, parts.next()?, parts.next()?);
     if parts.next().is_some() || y.len() != 4 || m.is_empty() || d.is_empty() {
         return None;
     }
-    Date::new(y.parse().ok()?, m.parse().ok()?, d.parse().ok()?).ok()
+    Date::new(y.parse().ok()?, m.parse().ok()?, d.parse().ok()?)
+        .ok()
+        .and_then(year_in_range)
 }
 
 #[cfg(test)]

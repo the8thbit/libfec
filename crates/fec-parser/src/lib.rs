@@ -49,8 +49,14 @@ use csv::{ByteRecord, StringRecord};
 use indexmap::IndexMap;
 use jiff::civil::Date;
 use mappings::column_names_for_field;
+use std::cell::Cell;
 use std::iter::Peekable;
-use std::{fs, io::Read, path::Path};
+use std::rc::Rc;
+use std::{
+    fs,
+    io::{self, Read},
+    path::Path,
+};
 use thiserror::Error;
 
 pub fn try_format_fec_date(value: &str) -> String {
@@ -542,8 +548,7 @@ impl<R: Read> Filing<R> {
                     Some(Err(e)) => return Some(Err(FilingRowReadError::TextRecordError(e))),
                     Some(Ok(record)) => match record.get(0) {
                         Some(f) if is_end_text(f) => {
-                            let record = self.records_iter.next()?;
-                            let record = match record {
+                            let record = match self.records_iter.next()? {
                                 Ok(r) => r,
                                 Err(e) => return Some(Err(FilingRowReadError::CsvError(e))),
                             };
@@ -637,19 +642,21 @@ fn open_header<R: Read>(rdr: R) -> anyhow::Result<(RawHeader, Peekable<Records<R
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("no header record found"))??;
 
-            let hdr_record_type = String::from_utf8(
-                hdr.get(0)
-                    .ok_or_else(|| anyhow::anyhow!("file missing header"))?
-                    .to_vec(),
-            )
-            .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in header record type: {}", e))?;
+            let raw_record_type = hdr
+                .get(0)
+                .ok_or_else(|| anyhow::anyhow!("file missing header"))?;
+            std::str::from_utf8(raw_record_type)
+                .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in header record type: {}", e))?;
+
+            // Check the record type after unquoting: FS filings may quote
+            // every field, `"HDR"` included (e.g. Mosaic e-filing).
+            let record = string_record(delimiter, hdr);
+            let hdr_record_type = record.get(0).unwrap_or_default();
             if !hdr_record_type.trim().eq_ignore_ascii_case("HDR") {
                 return Err(anyhow::anyhow!(
                     "Incorrect header record type: {hdr_record_type}"
                 ));
             }
-
-            let record = string_record(delimiter, hdr);
             Ok((RawHeader::Record { record, delimiter }, records_iter))
         }
     }
@@ -671,6 +678,58 @@ pub fn read_header<R: Read>(rdr: R) -> anyhow::Result<(FilingHeader, u64)> {
             Ok((FilingHeader::from_record(record, delimiter)?, 1))
         }
     }
+}
+
+/// How many bytes at the start of `prefix` settle the filing's header and
+/// cover (or the error [`Filing::from_reader`] would return), so a caller
+/// streaming a filing can stop once it has them. `None` while they could
+/// still depend on bytes after `prefix`; at the end of the file, parse
+/// whatever there is.
+///
+/// For `Some(n)`, parsing `prefix[..n]` followed by any bytes gives the same
+/// header and cover as parsing `prefix[..n]` alone. This holds by
+/// construction: [`Filing::from_reader`] runs on a reader that hands out one
+/// line per `read()` and notes whether it was asked for a byte past `prefix`.
+/// Every consumer in `from_reader` (the format sniffer, the csv and line
+/// readers, the `/* Header` block, the F99 text block) needs a whole line
+/// before it decides anything, so a line-sized read never pulls bytes the
+/// parser doesn't need.
+pub fn cover_end(prefix: &[u8]) -> Option<usize> {
+    /// `prefix`, a line (through its `\r` or `\n`) per read. `None` in `read`
+    /// once it runs out: the parse wanted more than `prefix`.
+    struct Lines<'a> {
+        prefix: &'a [u8],
+        read: Rc<Cell<Option<usize>>>,
+    }
+    impl Read for Lines<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let Some(pos) = self.read.get() else {
+                return Err(io::Error::other("need more of the filing"));
+            };
+            let rest = &self.prefix[pos..];
+            if rest.is_empty() {
+                self.read.set(None);
+                return Err(io::Error::other("need more of the filing"));
+            }
+            let line = rest
+                .iter()
+                .position(|b| *b == b'\n' || *b == b'\r')
+                .map_or(rest.len(), |i| i + 1);
+            let n = line.min(out.len());
+            out[..n].copy_from_slice(&rest[..n]);
+            self.read.set(Some(pos + n));
+            Ok(n)
+        }
+    }
+
+    let read = Rc::new(Cell::new(Some(0)));
+    let lines = Lines {
+        prefix,
+        read: Rc::clone(&read),
+    };
+    // Ok or Err, the outcome is settled unless the reader ran out.
+    let _ = Filing::from_reader(lines, String::new(), prefix.len());
+    read.get()
 }
 
 /// Read the body of a `[BEGINTEXT]` block whose marker record has just been
@@ -886,5 +945,37 @@ mod tests {
              SA11AI\x1cC00776393\x1cJANE DOE\x1c50.00\r\n",
         );
         assert_eq!(rows, [["SA11AI", "C00776393", "JANE DOE", "50.00"]]);
+    }
+
+    #[test]
+    fn row_lines_are_file_lines() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fec-py/tests/fixtures/1921705.fec"
+        );
+        let mut filing =
+            Filing::<std::fs::File>::from_path(std::path::Path::new(path)).expect("open fixture");
+        let mut lines = vec![];
+        while let Some(row) = filing.next_row() {
+            lines.push(row.expect("read row").line);
+        }
+        assert_eq!(lines, (3..=22).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn row_after_endtext_has_its_line() {
+        // LF line ends: with CRLF ones every row's `line` is currently one
+        // short (the csv reader starts the record at the previous `\n`).
+        let src = HEADER_AND_COVER.replace("\r\n", "\n")
+            + "SA11AI\x1cC00776393\x1cJANE DOE\x1c50.00\n\
+               [BEGINTEXT]\nsome text\n[ENDTEXT]\n\
+               SA11AI\x1cC00776393\x1cJOHN DOE\x1c25.00\n";
+        let mut filing = Filing::from_reader(src.as_bytes(), "FEC-1".to_owned(), src.len())
+            .expect("parse filing");
+        let mut lines = vec![];
+        while let Some(row) = filing.next_row() {
+            lines.push(row.expect("read row").line);
+        }
+        assert_eq!(lines, [3, 7]);
     }
 }
